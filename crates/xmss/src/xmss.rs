@@ -1,24 +1,25 @@
 use multilinear_toolkit::prelude::*;
 use rand::{SeedableRng, rngs::StdRng};
+use serde::{Deserialize, Serialize};
 use sha3::{Digest as Sha3Digest, Keccak256};
 
 use crate::*;
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct XmssSecretKey {
     pub(crate) first_slot: u64,
     pub(crate) seed: [u8; 32],
     pub(crate) merkle_tree: Vec<Vec<Digest>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct XmssSignature {
     pub wots_signature: WotsSignature,
     pub slot: u64, // unused for now (Toy XMSS)
     pub merkle_proof: Vec<Digest>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct XmssPublicKey {
     pub merkle_root: Digest,
     pub first_slot: u64,

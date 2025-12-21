@@ -1576,6 +1576,7 @@ dependencies = [
  "p3-koala-bear",
  "p3-util",
  "rand",
+ "serde",
  "sha3",
  "utils",
 ]

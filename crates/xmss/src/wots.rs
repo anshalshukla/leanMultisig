@@ -1,21 +1,44 @@
 use multilinear_toolkit::prelude::*;
 use p3_util::log2_strict_usize;
 use rand::{Rng, RngCore};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use utils::{ToUsize, to_little_endian_bits};
 
 use crate::*;
 
-#[derive(Debug)]
+mod serde_digest_array {
+    use super::*;
+
+    pub fn serialize<S>(data: &[Digest; V], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        data.as_slice().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[Digest; V], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let vec: Vec<Digest> = Vec::deserialize(deserializer)?;
+        vec.try_into()
+            .map_err(|_| serde::de::Error::custom("Invalid array length"))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct WotsSecretKey {
+    #[serde(with = "serde_digest_array")]
     pub pre_images: [Digest; V],
     public_key: WotsPublicKey,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WotsPublicKey(pub [Digest; V]);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WotsPublicKey(#[serde(with = "serde_digest_array")] pub [Digest; V]);
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct WotsSignature {
+    #[serde(with = "serde_digest_array")]
     pub chain_tips: [Digest; V],
     pub randomness: Digest,
 }
