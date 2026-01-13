@@ -98,12 +98,11 @@ where
         &MleGroupRef::merge(&[&poly_eq_point_packed.by_ref(), &c_minus_indexes_packed.by_ref()]),
     );
 
-    let c_minus_increments = MleRef::Extension(
-        &(0..table.unpacked_len())
-            .into_par_iter()
-            .map(|i| c - PF::<EF>::from_usize(i))
-            .collect::<Vec<_>>(),
-    );
+    let c_minus_increments_vec: Vec<_> = (0..table.unpacked_len())
+        .into_par_iter()
+        .map(|i| c - PF::<EF>::from_usize(i))
+        .collect();
+    let c_minus_increments = MleRef::Extension(&c_minus_increments_vec);
     let c_minus_increments_packed = c_minus_increments.pack_if(packing);
     let (_, claim_point_right, pushforward_final_eval, _) = prove_gkr_quotient::<_, 2>(
         prover_state,
