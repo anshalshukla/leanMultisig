@@ -29,6 +29,13 @@ pub fn init_aggregation_bytecode() {
     BYTECODE.get_or_init(compile_main_program_self_referential);
 }
 
+/// Like `init_aggregation_bytecode`, but reads .py sources from `dir` instead
+/// of the compile-time CARGO_MANIFEST_DIR. Use this when the .so runs on a
+/// different machine than where it was built.
+pub fn init_aggregation_bytecode_from_dir(dir: &Path) {
+    BYTECODE.get_or_init(|| compile_main_program_self_referential_from_dir(dir));
+}
+
 fn compile_main_program(inner_program_log_size: usize, bytecode_zero_eval: F) -> Bytecode {
     let bytecode_point_n_vars = inner_program_log_size + log2_ceil_usize(N_INSTRUCTION_COLUMNS);
     let claim_data_size = ((bytecode_point_n_vars + 1) * DIMENSION).next_multiple_of(DIGEST_LEN);
@@ -53,12 +60,55 @@ fn compile_main_program(inner_program_log_size: usize, bytecode_zero_eval: F) ->
     compile_program_with_flags(&ProgramSource::Filepath(filepath), CompilationFlags { replacements })
 }
 
+fn compile_main_program_from_dir(dir: &Path, inner_program_log_size: usize, bytecode_zero_eval: F) -> Bytecode {
+    let bytecode_point_n_vars = inner_program_log_size + log2_ceil_usize(N_INSTRUCTION_COLUMNS);
+    let claim_data_size = ((bytecode_point_n_vars + 1) * DIMENSION).next_multiple_of(DIGEST_LEN);
+    let claim_data_size_padded = claim_data_size.next_multiple_of(DIGEST_LEN);
+    let n_all_tweaks_fe = (1 + V * (1 << W) + 1 + LOG_LIFETIME) * TWEAK_LEN_FE;
+    let pub_input_size =
+        1 + DIGEST_LEN + MSG_LEN_FE + N_MERKLE_CHUNKS_FOR_SLOT + n_all_tweaks_fe + claim_data_size_padded + DIGEST_LEN;
+    let inner_public_memory_log_size = log2_ceil_usize(NONRESERVED_PROGRAM_INPUT_START + pub_input_size);
+    let replacements = build_replacements(
+        inner_program_log_size,
+        inner_public_memory_log_size,
+        bytecode_zero_eval,
+        pub_input_size,
+    );
+
+    let filepath = dir
+        .join("main.py")
+        .to_str()
+        .unwrap()
+        .to_string();
+    compile_program_with_flags(&ProgramSource::Filepath(filepath), CompilationFlags { replacements })
+}
+
 #[instrument(skip_all)]
 fn compile_main_program_self_referential() -> Bytecode {
     let mut log_size_guess = 19;
     let bytecode_zero_eval = F::ONE;
     loop {
         let bytecode = compile_main_program(log_size_guess, bytecode_zero_eval);
+        assert_eq!(bytecode_zero_eval, bytecode.instructions_multilinear[0]);
+        let actual_log_size = bytecode.log_size();
+        if actual_log_size == log_size_guess {
+            return bytecode;
+        } else {
+            println!(
+                "Wrong guess at `compile_main_program_self_referential`, should be {} instead of {}, recompiling...",
+                actual_log_size, log_size_guess
+            );
+        }
+        log_size_guess = actual_log_size;
+    }
+}
+
+#[instrument(skip_all)]
+fn compile_main_program_self_referential_from_dir(dir: &Path) -> Bytecode {
+    let mut log_size_guess = 19;
+    let bytecode_zero_eval = F::ONE;
+    loop {
+        let bytecode = compile_main_program_from_dir(dir, log_size_guess, bytecode_zero_eval);
         assert_eq!(bytecode_zero_eval, bytecode.instructions_multilinear[0]);
         let actual_log_size = bytecode.log_size();
         if actual_log_size == log_size_guess {
