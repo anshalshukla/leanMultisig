@@ -44,12 +44,50 @@ pub fn init_aggregation_bytecode() {
     BYTECODE.get_or_init(load_or_compile);
 }
 
+/// Like `init_aggregation_bytecode`, but reads .py sources from `dir` instead
+/// of the compile-time CARGO_MANIFEST_DIR. Use this when the .so runs on a
+/// different machine than where it was built.
+pub fn init_aggregation_bytecode_from_dir(dir: &Path) {
+    BYTECODE.get_or_init(|| load_or_compile_from_dir(dir));
+}
+
 fn compute_source_fingerprint() -> [u8; FINGERPRINT_SIZE] {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 
     // Collect all .py files in the crate root, sorted by name for determinism.
     let mut py_files: Vec<(String, String)> = Vec::new();
     for entry in std::fs::read_dir(manifest_dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "py") {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let content = std::fs::read_to_string(&path).unwrap();
+            py_files.push((name, content));
+        }
+    }
+    py_files.sort();
+
+    let replacements = compute_replacements(BYTECODE_GUESSED_LOG_SIZE, F::ONE);
+
+    let mut hasher = Sha3_256::new();
+    for (name, content) in &py_files {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(content.as_bytes());
+        hasher.update(b"\0");
+    }
+    for (key, value) in &replacements {
+        hasher.update(key.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(value.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.finalize().into()
+}
+
+fn compute_source_fingerprint_from_dir(dir: &Path) -> [u8; FINGERPRINT_SIZE] {
+    let mut py_files: Vec<(String, String)> = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
         let entry = entry.unwrap();
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "py") {
@@ -117,6 +155,20 @@ fn load_or_compile() -> Bytecode {
     bytecode
 }
 
+fn load_or_compile_from_dir(dir: &Path) -> Bytecode {
+    let current_fp = compute_source_fingerprint_from_dir(dir);
+
+    if CACHED_BYTECODE_BYTES.len() > FINGERPRINT_SIZE {
+        let stored_fp: [u8; FINGERPRINT_SIZE] = CACHED_BYTECODE_BYTES[..FINGERPRINT_SIZE].try_into().unwrap();
+        if current_fp == stored_fp {
+            let cache_data = &CACHED_BYTECODE_BYTES[FINGERPRINT_SIZE..];
+            return deserialize_cache(cache_data).unwrap();
+        }
+    }
+    let bytecode = compile_from_source_dir(dir);
+    bytecode
+}
+
 fn deserialize_cache(data: &[u8]) -> Option<Bytecode> {
     let decompressed = lz4_flex::decompress_size_prepended(data).ok()?;
     let mut bytecode: Bytecode = postcard::from_bytes(&decompressed).ok()?;
@@ -174,6 +226,25 @@ fn compile_from_source() -> Bytecode {
     }
 }
 
+fn compile_from_source_dir(dir: &Path) -> Bytecode {
+    let mut log_size_guess = BYTECODE_GUESSED_LOG_SIZE;
+    let bytecode_zero_eval = F::ONE;
+    loop {
+        let bytecode = compile_main_program_from_dir(dir, log_size_guess, bytecode_zero_eval);
+        assert_eq!(bytecode_zero_eval, bytecode.instructions_multilinear[0]);
+        let actual_log_size = bytecode.log_size();
+        if actual_log_size == log_size_guess {
+            return bytecode;
+        } else {
+            println!(
+                "Wrong guess at `compile_main_program_self_referential`, should be {} instead of {}, recompiling...",
+                actual_log_size, log_size_guess
+            );
+        }
+        log_size_guess = actual_log_size;
+    }
+}
+
 fn compute_replacements(inner_program_log_size: usize, bytecode_zero_eval: F) -> BTreeMap<String, String> {
     let bytecode_point_n_vars = inner_program_log_size + log2_ceil_usize(N_INSTRUCTION_COLUMNS);
     let claim_data_size = ((bytecode_point_n_vars + 1) * DIMENSION).next_multiple_of(DIGEST_LEN);
@@ -194,6 +265,16 @@ fn compute_replacements(inner_program_log_size: usize, bytecode_zero_eval: F) ->
 fn compile_main_program(inner_program_log_size: usize, bytecode_zero_eval: F) -> Bytecode {
     let replacements = compute_replacements(inner_program_log_size, bytecode_zero_eval);
     let filepath = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("main.py")
+        .to_str()
+        .unwrap()
+        .to_string();
+    compile_program_with_flags(&ProgramSource::Filepath(filepath), CompilationFlags { replacements })
+}
+
+fn compile_main_program_from_dir(dir: &Path, inner_program_log_size: usize, bytecode_zero_eval: F) -> Bytecode {
+    let replacements = compute_replacements(inner_program_log_size, bytecode_zero_eval);
+    let filepath = dir
         .join("main.py")
         .to_str()
         .unwrap()

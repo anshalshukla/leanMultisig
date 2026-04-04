@@ -13,7 +13,7 @@ use utils::{build_prover_state, get_poseidon16, poseidon_compress_slice, poseido
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-pub use crate::compilation::{get_aggregation_bytecode, init_aggregation_bytecode};
+pub use crate::compilation::{get_aggregation_bytecode, init_aggregation_bytecode, init_aggregation_bytecode_from_dir};
 
 pub mod benchmark;
 mod compilation;
