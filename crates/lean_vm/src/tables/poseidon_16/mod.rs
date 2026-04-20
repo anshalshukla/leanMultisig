@@ -1,7 +1,7 @@
 use std::any::TypeId;
 
-use crate::execution::memory::MemoryAccess;
 use crate::*;
+use crate::{execution::memory::MemoryAccess, tables::poseidon_16::trace_gen::generate_trace_rows_for_perm};
 use backend::*;
 use utils::{ToUsize, poseidon16_compress};
 
@@ -82,14 +82,14 @@ fn mul_kb<A: PrimeCharacteristicRing + 'static>(a: A, value: F) -> A {
 }
 
 mod trace_gen;
-pub use trace_gen::{default_poseidon_16_row, fill_trace_poseidon_16};
+pub use trace_gen::fill_trace_poseidon_16;
 
 pub(super) const WIDTH_16: usize = 16;
 const HALF_INITIAL_FULL_ROUNDS: usize = POSEIDON1_HALF_FULL_ROUNDS / 2;
 const PARTIAL_ROUNDS: usize = POSEIDON1_PARTIAL_ROUNDS;
 const HALF_FINAL_FULL_ROUNDS: usize = POSEIDON1_HALF_FULL_ROUNDS / 2;
 
-pub const POSEIDON_PRECOMPILE_DATA: usize = 1; // domain separation: Poseidon16=1, Poseidon24=2 or 3 or 4, ExtensionOp>=8
+pub const POSEIDON16_PRECOMPILE_DATA: usize = 1; // domain separation: Poseidon16=1, Poseidon24=2 or 3 or 4, ExtensionOp>=8
 
 pub const POSEIDON_16_COL_FLAG: ColIndex = 0;
 pub const POSEIDON_16_COL_INDEX_INPUT_LEFT: ColIndex = 1;
@@ -98,12 +98,14 @@ pub const POSEIDON_16_COL_INDEX_INPUT_RES: ColIndex = 3;
 pub const POSEIDON_16_COL_INPUT_START: ColIndex = 4;
 pub const POSEIDON_16_COL_OUTPUT_START: ColIndex = num_cols_poseidon_16() - 8;
 
+pub const POSEIDON16_NAME: &str = "poseidon16_compress";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Poseidon16Precompile<const BUS: bool>;
 
 impl<const BUS: bool> TableT for Poseidon16Precompile<BUS> {
     fn name(&self) -> &'static str {
-        "poseidon16_compress"
+        POSEIDON16_NAME
     }
 
     fn table(&self) -> Table {
@@ -128,22 +130,35 @@ impl<const BUS: bool> TableT for Poseidon16Precompile<BUS> {
         ]
     }
 
+    #[allow(clippy::vec_init_then_push)] // https://github.com/leanEthereum/leanMultisig/issues/198
     fn bus(&self) -> Bus {
+        let mut data = Vec::with_capacity(4);
+        data.push(BusData::Constant(POSEIDON16_PRECOMPILE_DATA));
+        data.push(BusData::Column(POSEIDON_16_COL_INDEX_INPUT_LEFT));
+        data.push(BusData::Column(POSEIDON_16_COL_INDEX_INPUT_RIGHT));
+        data.push(BusData::Column(POSEIDON_16_COL_INDEX_INPUT_RES));
         Bus {
             direction: BusDirection::Pull,
             selector: POSEIDON_16_COL_FLAG,
-            data: vec![
-                BusData::Constant(POSEIDON_PRECOMPILE_DATA),
-                BusData::Column(POSEIDON_16_COL_INDEX_INPUT_LEFT),
-                BusData::Column(POSEIDON_16_COL_INDEX_INPUT_RIGHT),
-                BusData::Column(POSEIDON_16_COL_INDEX_INPUT_RES),
-            ],
+            data,
         }
     }
 
-    fn padding_row(&self) -> Vec<F> {
-        // depends on null_poseidon_16_hash_ptr (cf lean_prover/trace_gen.rs)
-        unreachable!()
+    fn padding_row(&self, zero_vec_ptr: usize, null_hash_16_ptr: usize, _null_hash_24_ptr: usize) -> Vec<F> {
+        let mut row = vec![F::ZERO; num_cols_poseidon_16()];
+        let ptrs: Vec<*mut F> = (0..num_cols_poseidon_16())
+            .map(|i| unsafe { row.as_mut_ptr().add(i) })
+            .collect();
+
+        let perm: &mut Poseidon1Cols16<&mut F> = unsafe { &mut *(ptrs.as_ptr() as *mut Poseidon1Cols16<&mut F>) };
+        perm.inputs.iter_mut().for_each(|x| **x = F::ZERO);
+        *perm.flag = F::ZERO;
+        *perm.index_a = F::from_usize(zero_vec_ptr);
+        *perm.index_b = F::from_usize(zero_vec_ptr);
+        *perm.index_res = F::from_usize(null_hash_16_ptr);
+
+        generate_trace_rows_for_perm(perm);
+        row
     }
 
     #[inline(always)]
@@ -152,8 +167,7 @@ impl<const BUS: bool> TableT for Poseidon16Precompile<BUS> {
         arg_a: F,
         arg_b: F,
         index_res_a: F,
-        _: usize,
-        _: usize,
+        _: PrecompileCompTimeArgs<usize>,
         ctx: &mut InstructionContext<'_, M>,
     ) -> Result<(), RunnerError> {
         let trace = ctx.traces.get_mut(&self.table()).unwrap();
@@ -215,7 +229,7 @@ impl<const BUS: bool> Air for Poseidon16Precompile<BUS> {
                 extra_data,
                 cols.flag,
                 &[
-                    AB::IF::from_usize(POSEIDON_PRECOMPILE_DATA),
+                    AB::IF::from_usize(POSEIDON16_PRECOMPILE_DATA),
                     cols.index_a,
                     cols.index_b,
                     cols.index_res,
@@ -224,7 +238,7 @@ impl<const BUS: bool> Air for Poseidon16Precompile<BUS> {
         } else {
             builder.declare_values(std::slice::from_ref(&cols.flag));
             builder.declare_values(&[
-                AB::IF::from_usize(POSEIDON_PRECOMPILE_DATA),
+                AB::IF::from_usize(POSEIDON16_PRECOMPILE_DATA),
                 cols.index_a,
                 cols.index_b,
                 cols.index_res,

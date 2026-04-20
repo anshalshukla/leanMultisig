@@ -79,8 +79,8 @@ fn mul_kb_24<A: PrimeCharacteristicRing + 'static>(a: A, value: F) -> A {
 }
 
 mod trace_gen;
-pub use trace_gen::default_poseidon_24_row;
 pub use trace_gen::fill_trace_poseidon_24;
+use trace_gen::generate_trace_rows_for_perm_24;
 
 pub(super) const WIDTH_24: usize = 24;
 const HALF_INITIAL_FULL_ROUNDS_24: usize = POSEIDON1_HALF_FULL_ROUNDS_24 / 2;
@@ -90,14 +90,31 @@ const HALF_FINAL_FULL_ROUNDS_24: usize = POSEIDON1_HALF_FULL_ROUNDS_24 / 2;
 pub const POSEIDON_24_PRECOMPILE_DATA_OFFSET: usize = 2; // domain separation: Poseidon16=1, Poseidon24= 2 or 3 or 4, ExtensionOp>=8
 
 // 3 modes for Poseidon24 precompile:
-//   compress_0_9 (mode=0): feedforward + output[0..9]    -> precompile_data = 2
-//   permute_0_9  (mode=1): permutation + output[0..9] -> precompile_data = 3
-//   permute_9_18 (mode=2): permutation + output[9..18]-> precompile_data = 4
+//   Compress0_9:  feedforward + output[0..9]    -> precompile_data = 2
+//   Permute0_9:   permutation + output[0..9]    -> precompile_data = 3
+//   Permute9_18:  permutation + output[9..18]   -> precompile_data = 4
 // 2 committed boolean columns: is_compress_0_9, is_permute_0_9
 // 3rd mode deduced: is_permute_9_18 = 1 - is_compress_0_9 - is_permute_0_9
-pub const POSEIDON_24_MODE_COMPRESS_0_9: usize = 0;
-pub const POSEIDON_24_MODE_PERMUTE_0_9: usize = 1;
-pub const POSEIDON_24_MODE_PERMUTE_9_18: usize = 2;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+pub enum Poseidon24Mode {
+    Compress0_9 = 0,
+    Permute0_9 = 1,
+    Permute9_18 = 2,
+}
+
+impl Poseidon24Mode {
+    pub const fn as_usize(self) -> usize {
+        self as usize
+    }
+
+    pub const fn is_compress(self) -> bool {
+        matches!(self, Self::Compress0_9)
+    }
+
+    pub const fn is_permute_0_9(self) -> bool {
+        matches!(self, Self::Permute0_9)
+    }
+}
 
 pub const POSEIDON_24_INPUT_LEFT_SIZE: usize = 9;
 pub const POSEIDON_24_INPUT_RIGHT_SIZE: usize = 15;
@@ -115,12 +132,14 @@ pub const POSEIDON_24_COL_OUTPUT_START: ColIndex = num_cols_poseidon_24() - POSE
 // virtual columns (not committed)
 pub const POSEIDON_24_COL_PRECOMPILE_DATA: usize = num_cols_poseidon_24();
 
+pub const POSEIDON24_NAME: &str = "poseidon24_compress";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Poseidon24Precompile<const BUS: bool>;
 
 impl<const BUS: bool> TableT for Poseidon24Precompile<BUS> {
     fn name(&self) -> &'static str {
-        "poseidon24_compress"
+        POSEIDON24_NAME
     }
 
     fn table(&self) -> Table {
@@ -148,16 +167,17 @@ impl<const BUS: bool> TableT for Poseidon24Precompile<BUS> {
         ]
     }
 
+    #[allow(clippy::vec_init_then_push)] // https://github.com/leanEthereum/leanMultisig/issues/198
     fn bus(&self) -> Bus {
+        let mut data = Vec::with_capacity(4);
+        data.push(BusData::Column(POSEIDON_24_COL_PRECOMPILE_DATA));
+        data.push(BusData::Column(POSEIDON_24_COL_INDEX_INPUT_LEFT));
+        data.push(BusData::Column(POSEIDON_24_COL_INDEX_INPUT_RIGHT));
+        data.push(BusData::Column(POSEIDON_24_COL_INDEX_RES));
         Bus {
             direction: BusDirection::Pull,
             selector: POSEIDON_24_COL_FLAG,
-            data: vec![
-                BusData::Column(POSEIDON_24_COL_PRECOMPILE_DATA),
-                BusData::Column(POSEIDON_24_COL_INDEX_INPUT_LEFT),
-                BusData::Column(POSEIDON_24_COL_INDEX_INPUT_RIGHT),
-                BusData::Column(POSEIDON_24_COL_INDEX_RES),
-            ],
+            data,
         }
     }
 
@@ -165,9 +185,26 @@ impl<const BUS: bool> TableT for Poseidon24Precompile<BUS> {
         self.n_columns() + 1 // +1 for POSEIDON_24_POSEIDON_24_COL_PRECOMPILE_DATA
     }
 
-    fn padding_row(&self) -> Vec<F> {
-        // depends on null_poseidon_24_hash_ptr (cf lean_prover/trace_gen.rs)
-        unreachable!()
+    fn padding_row(&self, zero_vec_ptr: usize, _null_hash_16_ptr: usize, null_hash_24_ptr: usize) -> Vec<F> {
+        let mut row = vec![F::ZERO; num_cols_poseidon_24() + 1];
+        let ptrs: Vec<*mut F> = (0..num_cols_poseidon_24())
+            .map(|i| unsafe { row.as_mut_ptr().add(i) })
+            .collect();
+
+        let perm: &mut Poseidon1Cols24<&mut F> = unsafe { &mut *(ptrs.as_ptr() as *mut Poseidon1Cols24<&mut F>) };
+        perm.inputs.iter_mut().for_each(|x| **x = F::ZERO);
+        *perm.flag = F::ZERO;
+        *perm.is_compress_0_9 = F::ONE; // convention
+        *perm.is_permute_0_9 = F::ZERO;
+        *perm.index_input_left = F::from_usize(zero_vec_ptr);
+        *perm.index_input_right = F::from_usize(zero_vec_ptr);
+        *perm.index_res = F::from_usize(null_hash_24_ptr);
+
+        generate_trace_rows_for_perm_24(perm);
+        // virtual column
+        row[POSEIDON_24_COL_PRECOMPILE_DATA] =
+            F::from_usize(POSEIDON_24_PRECOMPILE_DATA_OFFSET + Poseidon24Mode::Compress0_9.as_usize()); // ...following the above convention
+        row
     }
 
     #[inline(always)]
@@ -176,13 +213,14 @@ impl<const BUS: bool> TableT for Poseidon24Precompile<BUS> {
         index_input_left: F,
         index_input_right: F,
         index_res: F,
-        mode: usize,
-        _: usize,
+        args: PrecompileCompTimeArgs<usize>,
         ctx: &mut InstructionContext<'_, M>,
     ) -> Result<(), RunnerError> {
-        assert!(mode <= POSEIDON_24_MODE_PERMUTE_9_18, "invalid poseidon24 mode={mode}");
-        let is_compress_0_9 = mode == POSEIDON_24_MODE_COMPRESS_0_9;
-        let is_permute_0_9 = mode == POSEIDON_24_MODE_PERMUTE_0_9;
+        let PrecompileCompTimeArgs::Poseidon24(mode) = args else {
+            panic!("expected Poseidon24 precompile args");
+        };
+        let is_compress_0_9 = mode.is_compress();
+        let is_permute_0_9 = mode.is_permute_0_9();
         let trace = ctx.traces.get_mut(&self.table()).unwrap();
 
         let arg0 = ctx
@@ -197,10 +235,9 @@ impl<const BUS: bool> TableT for Poseidon24Precompile<BUS> {
         input[POSEIDON_24_INPUT_LEFT_SIZE..].copy_from_slice(&arg1);
 
         let result = match mode {
-            POSEIDON_24_MODE_COMPRESS_0_9 => poseidon24_compress_0_9(input),
-            POSEIDON_24_MODE_PERMUTE_0_9 => poseidon24_permute_0_9(input),
-            POSEIDON_24_MODE_PERMUTE_9_18 => poseidon24_permute_9_18(input),
-            _ => unreachable!(),
+            Poseidon24Mode::Compress0_9 => poseidon24_compress_0_9(input),
+            Poseidon24Mode::Permute0_9 => poseidon24_permute_0_9(input),
+            Poseidon24Mode::Permute9_18 => poseidon24_permute_9_18(input),
         };
 
         let res_a: [F; POSEIDON_24_OUTPUT_SIZE] = result[..POSEIDON_24_OUTPUT_SIZE].try_into().unwrap();
@@ -216,7 +253,8 @@ impl<const BUS: bool> TableT for Poseidon24Precompile<BUS> {
         for (i, value) in input.iter().enumerate() {
             trace.columns[POSEIDON_24_COL_INPUT_START + i].push(*value);
         }
-        trace.columns[POSEIDON_24_COL_PRECOMPILE_DATA].push(F::from_usize(POSEIDON_24_PRECOMPILE_DATA_OFFSET + mode));
+        trace.columns[POSEIDON_24_COL_PRECOMPILE_DATA]
+            .push(F::from_usize(POSEIDON_24_PRECOMPILE_DATA_OFFSET + mode.as_usize()));
 
         // the rest of the trace is filled at the end of the execution (for parallelism + SIMD)
 
@@ -249,10 +287,10 @@ impl<const BUS: bool> Air for Poseidon24Precompile<BUS> {
         };
 
         let precompile_data = AB::IF::from_usize(POSEIDON_24_PRECOMPILE_DATA_OFFSET)
-            + cols.is_compress_0_9 * AB::IF::from_usize(POSEIDON_24_MODE_COMPRESS_0_9)
-            + cols.is_permute_0_9 * AB::IF::from_usize(POSEIDON_24_MODE_PERMUTE_0_9)
+            + cols.is_compress_0_9 * AB::IF::from_usize(Poseidon24Mode::Compress0_9.as_usize())
+            + cols.is_permute_0_9 * AB::IF::from_usize(Poseidon24Mode::Permute0_9.as_usize())
             + (AB::IF::ONE - cols.is_compress_0_9 - cols.is_permute_0_9) // is_permute_9_18
-                * AB::IF::from_usize(POSEIDON_24_MODE_PERMUTE_9_18);
+                * AB::IF::from_usize(Poseidon24Mode::Permute9_18.as_usize());
 
         if BUS {
             builder.eval_virtual_column(eval_virtual_bus_column::<AB, EF>(

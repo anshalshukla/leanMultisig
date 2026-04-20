@@ -17,7 +17,7 @@ use sub_protocols::{min_stacked_n_vars, total_whir_statements};
 use tracing::instrument;
 use utils::Counter;
 
-use crate::{MERKLE_LEVELS_PER_CHUNK_FOR_SLOT, N_MERKLE_CHUNKS_FOR_SLOT};
+use crate::{MERKLE_LEVELS_PER_CHUNK_FOR_SLOT, N_MERKLE_CHUNKS_FOR_SLOT, NUM_REPEATED_ONES, ZERO_VEC_LEN};
 
 static BYTECODE: OnceLock<Bytecode> = OnceLock::new();
 const BYTECODE_GUESSED_LOG_SIZE: usize = 19;
@@ -50,32 +50,14 @@ pub fn init_aggregation_bytecode() {
 pub fn init_aggregation_bytecode_from_dir(dir: &Path) {
     BYTECODE.get_or_init(|| load_or_compile_from_dir(dir));
 }
+const PY_SOURCE_FINGERPRINT_HEX: &str = env!("REC_AGGREGATION_PY_FINGERPRINT");
 
 fn compute_source_fingerprint() -> [u8; FINGERPRINT_SIZE] {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-
-    // Collect all .py files in the crate root, sorted by name for determinism.
-    let mut py_files: Vec<(String, String)> = Vec::new();
-    for entry in std::fs::read_dir(manifest_dir).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "py") {
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            let content = std::fs::read_to_string(&path).unwrap();
-            py_files.push((name, content));
-        }
-    }
-    py_files.sort();
-
     let replacements = compute_replacements(BYTECODE_GUESSED_LOG_SIZE, F::ONE);
 
     let mut hasher = Sha3_256::new();
-    for (name, content) in &py_files {
-        hasher.update(name.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(content.as_bytes());
-        hasher.update(b"\0");
-    }
+    hasher.update(PY_SOURCE_FINGERPRINT_HEX.as_bytes());
+    hasher.update(b"\0");
     for (key, value) in &replacements {
         hasher.update(key.as_bytes());
         hasher.update(b"\0");
@@ -250,16 +232,11 @@ fn compute_replacements(inner_program_log_size: usize, bytecode_zero_eval: F) ->
     let claim_data_size = ((bytecode_point_n_vars + 1) * DIMENSION).next_multiple_of(DIGEST_LEN);
     let claim_data_size_padded = claim_data_size.next_multiple_of(DIGEST_LEN);
     let n_all_tweaks_fe = (1 + V * (1 << W) + 1 + LOG_LIFETIME) * TWEAK_LEN_FE; // encoding + chain + leaf + merkle
-    // pub_input layout: n_sigs(1) + slice_hash(8) + message(9) + merkle_chunks(8) + all_tweaks + bytecode_claim(padded) + bytecode_hash(8)
-    let pub_input_size =
+    // input_data layout: n_sigs(1) + slice_hash(8) + message(9) + merkle_chunks(8) + all_tweaks + bytecode_claim(padded) + bytecode_hash_domsep(8)
+    let input_data_size =
         1 + DIGEST_LEN + MSG_LEN_FE + N_MERKLE_CHUNKS_FOR_SLOT + n_all_tweaks_fe + claim_data_size_padded + DIGEST_LEN;
-    let inner_public_memory_log_size = log2_ceil_usize(NONRESERVED_PROGRAM_INPUT_START + pub_input_size);
-    build_replacements(
-        inner_program_log_size,
-        inner_public_memory_log_size,
-        bytecode_zero_eval,
-        pub_input_size,
-    )
+    let input_data_size_padded = input_data_size.next_multiple_of(DIGEST_LEN);
+    build_replacements(inner_program_log_size, bytecode_zero_eval, input_data_size_padded)
 }
 
 fn compile_main_program(inner_program_log_size: usize, bytecode_zero_eval: F) -> Bytecode {
@@ -274,19 +251,14 @@ fn compile_main_program(inner_program_log_size: usize, bytecode_zero_eval: F) ->
 
 fn compile_main_program_from_dir(dir: &Path, inner_program_log_size: usize, bytecode_zero_eval: F) -> Bytecode {
     let replacements = compute_replacements(inner_program_log_size, bytecode_zero_eval);
-    let filepath = dir
-        .join("main.py")
-        .to_str()
-        .unwrap()
-        .to_string();
+    let filepath = dir.join("main.py").to_str().unwrap().to_string();
     compile_program_with_flags(&ProgramSource::Filepath(filepath), CompilationFlags { replacements })
 }
 
 fn build_replacements(
     inner_program_log_size: usize,
-    inner_public_memory_log_size: usize,
     bytecode_zero_eval: F,
-    pub_input_size: usize,
+    input_data_size_padded: usize,
 ) -> BTreeMap<String, String> {
     let mut replacements = BTreeMap::new();
 
@@ -451,14 +423,14 @@ fn build_replacements(
     );
     replacements.insert("COL_PC_PLACEHOLDER".to_string(), COL_PC.to_string());
     replacements.insert(
-        "NONRESERVED_PROGRAM_INPUT_START_PLACEHOLDER".to_string(),
-        NONRESERVED_PROGRAM_INPUT_START.to_string(),
+        "INPUT_DATA_SIZE_PADDED_PLACEHOLDER".to_string(),
+        input_data_size_padded.to_string(),
     );
+    let bytecode_point_n_vars = log_inner_bytecode + log2_ceil_usize(N_INSTRUCTION_COLUMNS);
     replacements.insert(
-        "INNER_PUBLIC_MEMORY_LOG_SIZE_PLACEHOLDER".to_string(),
-        inner_public_memory_log_size.to_string(),
+        "BYTECODE_SUMCHECK_PROOF_SIZE_PLACEHOLDER".to_string(),
+        bytecode_reduction_sumcheck_proof_size(bytecode_point_n_vars).to_string(),
     );
-    replacements.insert("PUB_INPUT_SIZE_PLACEHOLDER".to_string(), pub_input_size.to_string());
 
     let mut lookup_indexes_str = vec![];
     let mut lookup_values_str = vec![];
@@ -527,6 +499,10 @@ fn build_replacements(
         format!("[{}]", air_degrees.join(", ")),
     );
     replacements.insert(
+        "MAX_AIR_FULL_DEGREE_PLACEHOLDER".to_string(),
+        (ALL_TABLES.iter().map(|t| t.degree_air()).max().unwrap() + 1).to_string(),
+    );
+    replacements.insert(
         "N_AIR_COLUMNS_PLACEHOLDER".to_string(),
         format!("[{}]", n_air_columns.join(", ")),
     );
@@ -583,8 +559,18 @@ fn build_replacements(
         "BYTECODE_ZERO_EVAL_PLACEHOLDER".to_string(),
         bytecode_zero_eval.as_canonical_u64().to_string(),
     );
+    replacements.insert("ZERO_VEC_LEN_PLACEHOLDER".to_string(), ZERO_VEC_LEN.to_string());
+    replacements.insert(
+        "NUM_REPEATED_ONES_PLACEHOLDER".to_string(),
+        NUM_REPEATED_ONES.to_string(),
+    );
 
     replacements
+}
+
+pub(crate) fn bytecode_reduction_sumcheck_proof_size(bytecode_point_n_vars: usize) -> usize {
+    let per_round = (3 * DIMENSION).next_multiple_of(DIGEST_LEN);
+    DIGEST_LEN + bytecode_point_n_vars * per_round
 }
 
 fn all_air_evals_in_zk_dsl() -> String {

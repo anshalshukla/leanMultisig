@@ -7,6 +7,28 @@ TWO_ADICITY = 24
 ROOT = 1791270792  # of order 2^TWO_ADICITY
 
 
+@inline
+def build_preamble_memory():
+    zero_vec_w = ZERO_VEC_PTR
+    for i in unroll(0, ZERO_VEC_LEN):
+        zero_vec_w[i] = 0
+
+    sds_w = SAMPLING_DOMAIN_SEPARATOR_PTR
+    sds_w[0] = 1
+    for i in unroll(1, DIGEST_LEN):
+        sds_w[i] = 0
+
+    one_ef_w = ONE_EF_PTR
+    one_ef_w[0] = 1
+    for i in unroll(1, DIM):
+        one_ef_w[i] = 0
+
+    repeated_ones_w = REPEATED_ONES_PTR
+    for i in unroll(0, NUM_REPEATED_ONES):
+        repeated_ones_w[i] = 1
+    return
+
+
 def div_ceil_dynamic(a, b: Const):
     debug_assert(a <= 150)
     res = match_range(a, range(0, 151), lambda i: div_ceil(i, b))
@@ -41,6 +63,23 @@ def poly_eq_extension_dynamic(point, n):
     return res
 
 
+def product_first_n(values, n):
+    # values: pointer to n EFs
+    # Returns ∏_{i=0}^{n-1} values[i]
+    debug_assert(n < 33)
+    res = match_range(n, range(0, 1), lambda _: ONE_EF_PTR, range(1, 33), lambda i: product_first_n_const(values, i))
+    return res
+
+
+@inline
+def product_first_n_const(values, n):
+    debug_assert(n != 0)
+    debug_assert(n <= NUM_REPEATED_ONES)
+    res = Array(DIM)
+    poly_eq_be(REPEATED_ONES_PTR, values, res, n)
+    return res
+
+
 def poly_eq_extension(point, n: Const):
     # Example: for n = 2: eq(x, y) = [(1 - x)(1 - y), (1 - x)y, x(1 - y), xy]
 
@@ -59,20 +98,32 @@ def poly_eq_extension(point, n: Const):
     return res + (2**n - 1) * DIM
 
 
-def eq_mle_extension(a, b, n):
+@inline
+def eq_mle_extension_to(a, b, dst, n):
     debug_assert(n < 33)
     debug_assert(0 < n)
+    match_range(n, range(1, 33), lambda i: poly_eq_ee(a, b, dst, i))
+    return
+
+
+def eq_mle_extension(a, b, n):
     res = Array(DIM)
-    match_range(n, range(1, 33), lambda i: poly_eq_ee(a, b, res, i))
+    eq_mle_extension_to(a, b, res, n)
     return res
 
 
 @inline
-def eq_mle_base_extension(a, b, n):
+def eq_mle_base_extension_to(a, b, dst, n):
     debug_assert(n < 33)
     debug_assert(0 < n)
+    match_range(n, range(1, 33), lambda i: poly_eq_be(a, b, dst, i))
+    return
+
+
+@inline
+def eq_mle_base_extension(a, b, n):
     res = Array(DIM)
-    match_range(n, range(1, 33), lambda i: poly_eq_be(a, b, res, i))
+    eq_mle_base_extension_to(a, b, res, n)
     return res
 
 
@@ -353,6 +404,13 @@ def copy_8(a, b):
 
 
 @inline
+def copy_9(a, b):
+    dot_product_ee(a, ONE_EF_PTR, b)
+    dot_product_ee(a + (9 - DIM), ONE_EF_PTR, b + (9 - DIM))
+    return
+
+
+@inline
 def copy_15(a, b):
     copy_5(a, b)
     copy_5(a + 5, b + 5)
@@ -449,41 +507,116 @@ def checked_decompose_bits(a):
 
 
 @inline
-def checked_decompose_bits_and_compute_root_pow_const(a, domain_size):
-    # Hint 6 nibbles (4 bits each) + 1 top-7-bit value = 7 hints
+def whir_4_merkle_step_and_pow(v, state_in, path_chunk, state_out, power_shift):
+    whir_do_4_merkle_levels(v, state_in, path_chunk, state_out)
+    return ROOT ** (power_shift * v)
+
+
+@inline
+def whir_3_merkle_step_and_pow(v, state_in, path_chunk, state_out, power_shift):
+    whir_do_3_merkle_levels(v, state_in, path_chunk, state_out)
+    return ROOT ** (power_shift * (v % 8))
+
+
+@inline
+def whir_2_merkle_step_and_pow(v, state_in, path_chunk, state_out, power_shift):
+    whir_do_2_merkle_levels(v, state_in, path_chunk, state_out)
+    return ROOT ** (power_shift * (v % 4))
+
+
+@inline
+def whir_1_merkle_step_and_pow(v, state_in, path_chunk, state_out, power_shift):
+    whir_do_1_merkle_level(v, state_in, path_chunk, state_out)
+    return ROOT ** (power_shift * (v % 2))
+
+
+@inline
+def decompose_and_verify_merkle_query(a, domain_size, prev_root, num_chunks):
     nibbles = Array(6)
     top7: Imu
     hint_decompose_bits_merkle_whir(nibbles, top7, a, 4)
 
     for i in unroll(0, 6):
         assert nibbles[i] < 16
-
     assert top7 < 2**7
 
     partial_sum: Mut = nibbles[0]
     for i in unroll(1, 6):
         partial_sum += nibbles[i] * 16**i
-
     if top7 == 2**7 - 1:
         assert partial_sum == 0
-
     assert partial_sum + top7 * 2**24 == a
 
-    # Compute domain_generator^index
+    leaf_data = Array(num_chunks * DIGEST_LEN)
+    hint_witness("merkle_leaf", leaf_data)
+    leaf_hash = slice_hash_rtl(leaf_data, num_chunks)
+
+    merkle_path = Array(domain_size * DIGEST_LEN)
+    hint_witness("merkle_path", merkle_path)
+
+    n_nibbles = div_ceil(domain_size, 4)
+    states = Array((n_nibbles - 1) * DIGEST_LEN)
+
     prod: Mut = 1
-    for k in unroll(0, (domain_size - domain_size % 4) / 4):
-        nib_pow = match_range(nibbles[k], range(0, 16), lambda v: ROOT ** (2 ** (TWO_ADICITY - domain_size + 4 * k) * v))
+
+    # First nibble: leaf_hash -> states[0]
+    nib_pow = match_range(
+        nibbles[0],
+        range(0, 16),
+        lambda v: whir_4_merkle_step_and_pow(v, leaf_hash, merkle_path, states, 2 ** (TWO_ADICITY - domain_size)),
+    )
+    prod *= nib_pow
+
+    # Middle nibbles: states[k-1] -> states[k]
+    for k in unroll(1, n_nibbles - 1):
+        nib_pow = match_range(
+            nibbles[k],
+            range(0, 16),
+            lambda v: whir_4_merkle_step_and_pow(
+                v,
+                states + (k - 1) * DIGEST_LEN,
+                merkle_path + 4 * k * DIGEST_LEN,
+                states + k * DIGEST_LEN,
+                2 ** (TWO_ADICITY - domain_size + 4 * k),
+            ),
+        )
         prod *= nib_pow
 
-    if domain_size % 4 != 0:
-        edge_pow = match_range(
-            nibbles[(domain_size - domain_size % 4) / 4],
+    # Last nibble: states[-1] -> prev_root
+    last_k = n_nibbles - 1
+    last_state_in = states + (last_k - 1) * DIGEST_LEN
+    last_path = merkle_path + 4 * last_k * DIGEST_LEN
+    last_power_shift = 2 ** (TWO_ADICITY - domain_size + 4 * last_k)
+    if domain_size % 4 == 0:
+        nib_pow = match_range(
+            nibbles[last_k],
             range(0, 16),
-            lambda v: ROOT ** (2 ** (TWO_ADICITY - domain_size + 4 * ((domain_size - domain_size % 4) / 4)) * (v % 2 ** (domain_size % 4))),
+            lambda v: whir_4_merkle_step_and_pow(v, last_state_in, last_path, prev_root, last_power_shift),
         )
-        prod *= edge_pow
+        prod *= nib_pow
+    elif domain_size % 4 == 1:
+        nib_pow = match_range(
+            nibbles[last_k],
+            range(0, 16),
+            lambda v: whir_1_merkle_step_and_pow(v, last_state_in, last_path, prev_root, last_power_shift),
+        )
+        prod *= nib_pow
+    elif domain_size % 4 == 2:
+        nib_pow = match_range(
+            nibbles[last_k],
+            range(0, 16),
+            lambda v: whir_2_merkle_step_and_pow(v, last_state_in, last_path, prev_root, last_power_shift),
+        )
+        prod *= nib_pow
+    elif domain_size % 4 == 3:
+        nib_pow = match_range(
+            nibbles[last_k],
+            range(0, 16),
+            lambda v: whir_3_merkle_step_and_pow(v, last_state_in, last_path, prev_root, last_power_shift),
+        )
+        prod *= nib_pow
 
-    return nibbles, prod
+    return leaf_data, prod
 
 
 def checked_decompose_bits_small_value_const(to_decompose, n_bits: Const):
@@ -521,7 +654,7 @@ def dot_product_ee_ret(a, b, n):
 
 @inline
 def sum_continuous_ef(slice_ef, len):
-    debug_assert(len <= NUM_REPEATED_ONES_IN_RESERVED_MEMORY)
+    debug_assert(len <= NUM_REPEATED_ONES)
     res = Array(DIM)
     dot_product_be_dynamic(REPEATED_ONES_PTR, slice_ef, res, len)
     return res

@@ -75,7 +75,7 @@ pub fn get_execution_trace(bytecode: &Bytecode, execution_result: ExecutionResul
             let nu_c = flag_c * field_repr[instr_idx(COL_OPERAND_C)]
                 + (F::ONE - flag_c - flag_c_fp) * value_c
                 + flag_c_fp * (F::from_usize(fp) + field_repr[instr_idx(COL_OPERAND_C)]);
-            if let Instruction::Precompile { .. } = instruction {
+            if let Instruction::Precompile(..) = instruction {
                 *trace_row[COL_IS_PRECOMPILE] = F::ONE;
             }
             *trace_row[COL_EXEC_NU_A] = nu_a;
@@ -94,7 +94,9 @@ pub fn get_execution_trace(bytecode: &Bytecode, execution_result: ExecutionResul
 
     let mut memory_padded = memory.0.par_iter().map(|&v| v.unwrap_or(F::ZERO)).collect::<Vec<F>>();
 
-    // Write poseidon(0) at the end of used memory for poseidon table padding rows
+    // Write [0000000000000000 | poseidon16_compress(0000000000000000) | poseidon24_compress(000000000000000000000000)] (to make lookups work on padding-rows).
+    let padding_zero_vec_ptr = memory_padded.len();
+    memory_padded.extend(std::iter::repeat_n(F::ZERO, 16));
     let null_poseidon_16_hash_ptr = memory_padded.len();
     memory_padded.extend_from_slice(get_poseidon_16_of_zero());
     let null_poseidon_24_hash_ptr = memory_padded.len();
@@ -121,6 +123,7 @@ pub fn get_execution_trace(bytecode: &Bytecode, execution_result: ExecutionResul
         pad_table(
             &table,
             &mut traces,
+            padding_zero_vec_ptr,
             null_poseidon_16_hash_ptr,
             null_poseidon_24_hash_ptr,
         );
@@ -133,11 +136,11 @@ pub fn get_execution_trace(bytecode: &Bytecode, execution_result: ExecutionResul
         if traces[&table].log_n_rows < p24_log {
             let target = 1usize << p24_log;
             let trace = traces.get_mut(&table).unwrap();
-            let padding = if table == Table::poseidon16() {
-                default_poseidon_16_row(null_poseidon_16_hash_ptr)
-            } else {
-                table.padding_row()
-            };
+            let padding = table.padding_row(
+                padding_zero_vec_ptr,
+                null_poseidon_16_hash_ptr,
+                null_poseidon_24_hash_ptr,
+            );
             for (col, val) in trace.columns.iter_mut().zip(padding.iter()) {
                 col.resize(target, *val);
             }
@@ -162,6 +165,7 @@ pub fn get_execution_trace(bytecode: &Bytecode, execution_result: ExecutionResul
 fn pad_table(
     table: &Table,
     traces: &mut BTreeMap<Table, TableTrace>,
+    zero_vec_ptr: usize,
     null_poseidon_16_hash_ptr: usize,
     null_poseidon_24_hash_ptr: usize,
 ) {
@@ -171,13 +175,7 @@ fn pad_table(
     trace.non_padded_n_rows = h;
     trace.log_n_rows = log2_ceil_usize(h + 1).max(MIN_LOG_N_ROWS_PER_TABLE);
     let n_rows = 1 << trace.log_n_rows;
-    let padding_row = if *table == Table::poseidon16() {
-        default_poseidon_16_row(null_poseidon_16_hash_ptr)
-    } else if *table == Table::poseidon24() {
-        default_poseidon_24_row(null_poseidon_24_hash_ptr)
-    } else {
-        table.padding_row()
-    };
+    let padding_row = table.padding_row(zero_vec_ptr, null_poseidon_16_hash_ptr, null_poseidon_24_hash_ptr);
     trace.columns.par_iter_mut().enumerate().for_each(|(i, col)| {
         assert!(col.len() <= h); // potentially some columns have not been filled (in Poseidon -> we fill it later with SIMD + parallelism), but the first one should always be representative
         col.resize(n_rows, padding_row[i]);
